@@ -67,11 +67,11 @@ class MediumCNN(nn.Module):
 # -----------------------------
 # Train Loop
 # -----------------------------
-def train(model, loader, device):
+def train(model, loader, val_loader, device):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    model.train()
     for epoch in range(10):
+        model.train()
         total, correct, running_loss = 0, 0, 0.0
         for imgs, labels in loader:
             imgs, labels = imgs.to(device), labels.to(device)
@@ -84,13 +84,15 @@ def train(model, loader, device):
             _, pred = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (pred == labels).sum().item()
-        acc = (correct / total) * 100
-        print(f"Epoch {epoch+1}: Loss={running_loss:.4f}  Acc={acc:.2f}%")
+        train_acc = (correct / total) * 100
+        # Validation after each epoch
+        val_acc = evaluate(model, val_loader, device, silent=True)
+    print(f"Epoch {epoch+1}: Loss={running_loss:.4f}  Train Acc={train_acc:.2f}%  Val Acc={val_acc:.2f}%")
 
 # -----------------------------
 # Evaluation
 # -----------------------------
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, silent=False):
     model.eval()
     total, correct = 0, 0
     with torch.no_grad():
@@ -101,7 +103,9 @@ def evaluate(model, loader, device):
             total += labels.size(0)
             correct += (pred == labels).sum().item()
     acc = (correct / total) * 100
-    print(f"Final Test Accuracy: {acc:.2f}%")
+    if not silent:
+        print(f"Final Test Accuracy: {acc:.2f}%")
+    return acc
 
 # -----------------------------
 # Main
@@ -109,25 +113,44 @@ def evaluate(model, loader, device):
 import random
 
 def main():
-    # dataset: Weather/
-    all_dataset = WeatherDataset(Path("Weather"))
-    n = len(all_dataset)
+    import argparse
+    parser = argparse.ArgumentParser(description="Train and test weather classifier.")
+    parser.add_argument("test_folder", nargs="?", default=None, help="Path to external test folder.")
+    args = parser.parse_args()
+
+    # Load training data
+    trainval_dataset = WeatherDataset(Path("Weather"))
+    n = len(trainval_dataset)
     indices = list(range(n))
     random.seed(42)
     random.shuffle(indices)
-    split = int(0.8 * n)
-    train_idx, test_idx = indices[:split], indices[split:]
+    train_split = int(0.8 * n)
+    val_split = int(0.9 * n)
+    train_idx = indices[:train_split]
+    val_idx = indices[train_split:val_split]
+    test_idx = indices[val_split:]
     from torch.utils.data import Subset
-    train_dataset = Subset(all_dataset, train_idx)
-    test_dataset = Subset(all_dataset, test_idx)
+    train_dataset = Subset(trainval_dataset, train_idx)
+    val_dataset = Subset(trainval_dataset, val_idx)
+    internal_test_dataset = Subset(trainval_dataset, test_idx)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=32, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=32, num_workers=2)
+    internal_test_loader = DataLoader(internal_test_dataset, batch_size=32, num_workers=2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MediumCNN(num_classes=len(all_dataset.classes)).to(device)
+    model = MediumCNN(num_classes=len(trainval_dataset.classes)).to(device)
+
     print("Training...")
-    train(model, train_loader, device)
-    print("Evaluating...")
-    evaluate(model, test_loader, device)
+    train(model, train_loader, val_loader, device)
+
+    # If external test folder is provided, use it
+    if args.test_folder:
+        print(f"Testing with external folder: {args.test_folder}")
+        ext_test_dataset = WeatherDataset(Path(args.test_folder))
+        ext_test_loader = DataLoader(ext_test_dataset, batch_size=32, num_workers=2)
+        evaluate(model, ext_test_loader, device)
+    else:
+        print("Testing with internal test split...")
+        evaluate(model, internal_test_loader, device)
 
 if __name__ == "__main__":
     main()
