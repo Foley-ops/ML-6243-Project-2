@@ -1,25 +1,37 @@
 import sys
 from pathlib import Path
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms.functional as TF
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.transforms as T
 from torchvision.io import read_image
+from torchvision.models import resnet18
 
-# -----------------------------
-# Dataset Loader
-# -----------------------------
+# ============================================================
+# Dataset
+# ============================================================
 class WeatherDataset(Dataset):
-    def __init__(self, folder: Path):
-        self.paths = sorted([p for p in folder.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
+    def __init__(self, folder: Path, transform=None):
+        self.transform = transform
+
+        # Accept common image types
+        self.paths = sorted(
+            [p for p in folder.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+        )
+
+        if len(self.paths) == 0:
+            raise ValueError(f"No images found in: {folder}")
+
+        # Extract labels from filenames (prefix before any digit)
         self.labels = [self._extract_label(p.name) for p in self.paths]
-        self.classes = sorted(list(set(self.labels)))
+        self.classes = sorted(set(self.labels))
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
 
-    def _extract_label(self, filename: str) -> str:
-        for i, ch in enumerate(filename):
-            if ch.isdigit():
+    def _extract_label(self, filename: str):
+        for i, c in enumerate(filename):
+            if c.isdigit():
                 return filename[:i]
         return filename.split(".")[0]
 
@@ -27,53 +39,66 @@ class WeatherDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        path = str(self.paths[idx])
+        img_path = self.paths[idx]
         try:
-            img = read_image(path).float() / 255.0
-            if img.shape[0] == 1:
-                img = img.repeat(3, 1, 1)
-            elif img.shape[0] == 4:
-                img = img[:3, :, :]
-            elif img.shape[0] != 3:
-                return self.__getitem__((idx + 1) % len(self.paths))
-            img = TF.resize(img, [128, 128], antialias=True)
-            if img.shape != (3, 128, 128):
-                return self.__getitem__((idx + 1) % len(self.paths))
+            img = read_image(str(img_path)).float() / 255.0
         except Exception:
+            # Skip corrupted/unsupported images
             return self.__getitem__((idx + 1) % len(self.paths))
+
+        # normalize channels
+        if img.shape[0] == 1:
+            img = img.repeat(3, 1, 1)
+        elif img.shape[0] == 4:
+            img = img[:3]
+
         label = self.class_to_idx[self.labels[idx]]
+
+        if self.transform:
+            img = self.transform(img)
+
         return img, label
 
-# -----------------------------
-# CNN Model (<5M parameters)
-# -----------------------------
+
+# ============================================================
+# Medium CNN (your custom model)
+# ============================================================
 class MediumCNN(nn.Module):
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.Conv2d(256, 512, 3, stride=2, padding=1), nn.BatchNorm2d(512), nn.ReLU(),
+            nn.Conv2d(3, 64, 3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 512, 3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
         )
-        self.classifier = nn.Linear(512, num_classes)
+        self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
         x = self.features(x)
         x = x.view(x.size(0), -1)
-        return self.classifier(x)
+        return self.fc(x)
 
-# -----------------------------
-# Train Loop
-# -----------------------------
-def train(model, loader, val_loader, device):
+
+# ============================================================
+# Training Loop (Improved)
+# ============================================================
+def train(model, train_loader, val_loader, device, epochs=20):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    for epoch in range(10):
+    for epoch in range(1, epochs + 1):
         model.train()
         total, correct, running_loss = 0, 0, 0.0
-        for imgs, labels in loader:
+        for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(imgs)
@@ -81,76 +106,95 @@ def train(model, loader, val_loader, device):
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-            _, pred = torch.max(outputs, 1)
             total += labels.size(0)
-            correct += (pred == labels).sum().item()
-        train_acc = (correct / total) * 100
-        # Validation after each epoch
-        val_acc = evaluate(model, val_loader, device, silent=True)
-    print(f"Epoch {epoch+1}: Loss={running_loss:.4f}  Train Acc={train_acc:.2f}%  Val Acc={val_acc:.2f}%")
+            correct += (outputs.argmax(1) == labels).sum().item()
+        train_acc = 100 * correct / total
+        # Validation
+        val_acc, val_loss = evaluate(model, val_loader, device, return_loss=True)
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"Train Acc: {train_acc:.2f}% | "
+            f"Val Acc: {val_acc:.2f}% | "
+            f"Loss: {running_loss:.4f}"
+        )
 
-# -----------------------------
+
+# ============================================================
 # Evaluation
-# -----------------------------
-def evaluate(model, loader, device, silent=False):
+# ============================================================
+def evaluate(model, loader, device, return_loss=False):
+    criterion = nn.CrossEntropyLoss()
     model.eval()
+
     total, correct = 0, 0
+    total_loss = 0.0
+
     with torch.no_grad():
         for imgs, labels in loader:
             imgs, labels = imgs.to(device), labels.to(device)
             outputs = model(imgs)
-            _, pred = torch.max(outputs, 1)
+
             total += labels.size(0)
-            correct += (pred == labels).sum().item()
-    acc = (correct / total) * 100
-    if not silent:
-        print(f"Final Test Accuracy: {acc:.2f}%")
+            correct += (outputs.argmax(1) == labels).sum().item()
+            total_loss += criterion(outputs, labels).item()
+
+    acc = 100 * correct / total
+
+    if return_loss:
+        return acc, total_loss
     return acc
 
-# -----------------------------
+
+# ============================================================
 # Main
-# -----------------------------
-import random
-
+# ============================================================
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Train and test weather classifier.")
-    parser.add_argument("test_folder", nargs="?", default=None, help="Path to external test folder.")
-    args = parser.parse_args()
 
-    # Load training data
-    trainval_dataset = WeatherDataset(Path("Weather"))
-    n = len(trainval_dataset)
-    indices = list(range(n))
-    random.seed(42)
-    random.shuffle(indices)
-    train_split = int(0.8 * n)
-    val_split = int(0.9 * n)
-    train_idx = indices[:train_split]
-    val_idx = indices[train_split:val_split]
-    test_idx = indices[val_split:]
-    from torch.utils.data import Subset
-    train_dataset = Subset(trainval_dataset, train_idx)
-    val_dataset = Subset(trainval_dataset, val_idx)
-    internal_test_dataset = Subset(trainval_dataset, test_idx)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=32, num_workers=2)
-    internal_test_loader = DataLoader(internal_test_dataset, batch_size=32, num_workers=2)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MediumCNN(num_classes=len(trainval_dataset.classes)).to(device)
+    weather_dir = Path("Weather")
+    dataset = WeatherDataset(
+        weather_dir,
+        transform=T.Compose([
+            T.Resize((128, 128)),
+            T.RandomHorizontalFlip(),
+            T.RandomRotation(10),
+            T.ConvertImageDtype(torch.float32),
+        ]),
+    )
 
-    print("Training...")
-    train(model, train_loader, val_loader, device)
+    # Split dataset
+    n = len(dataset)
+    idx = list(range(n))
+    random.shuffle(idx)
 
-    # If external test folder is provided, use it
-    if args.test_folder:
-        print(f"Testing with external folder: {args.test_folder}")
-        ext_test_dataset = WeatherDataset(Path(args.test_folder))
-        ext_test_loader = DataLoader(ext_test_dataset, batch_size=32, num_workers=2)
-        evaluate(model, ext_test_loader, device)
-    else:
-        print("Testing with internal test split...")
-        evaluate(model, internal_test_loader, device)
+    train_idx = idx[:int(0.75 * n)]
+    val_idx   = idx[int(0.75 * n):int(0.9 * n)]
+    test_idx  = idx[int(0.9 * n):]
+
+    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=32, shuffle=True)
+    val_loader   = DataLoader(Subset(dataset, val_idx), batch_size=32)
+    test_loader  = DataLoader(Subset(dataset, test_idx), batch_size=32)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    print("Using device:", device)
+
+    num_classes = len(dataset.classes)
+
+    # Choose model
+    model = MediumCNN(num_classes).to(device)
+    # OR use better pretrained architecture:
+    # model = resnet18(weights=None)
+    # model.fc = nn.Linear(512, num_classes)
+    # model.to(device)
+
+    train(model, train_loader, val_loader, device, epochs=20)
+    print("\nEvaluating on test set...")
+    test_acc = evaluate(model, test_loader, device)
+    print(f"Final Test Accuracy: {test_acc:.2f}%")
+
 
 if __name__ == "__main__":
     main()
